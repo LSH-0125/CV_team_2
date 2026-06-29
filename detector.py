@@ -58,11 +58,11 @@ def belonging_meta(cls_name: str) -> dict:
 class Detector:
     def __init__(
         self,
-        person_model:  str   = "yolov8s.pt",
+        person_model:  str   = "yolo11s.pt",   # YOLO11 최신 모델
         luggage_model: str   = "yolov8s-worldv2.pt",
         person_conf:   float = 0.25,
         luggage_conf:  float = 0.2,
-        imgsz:         int   = 480,   # 640→480: 추론 ~2배 빠름
+        imgsz:         int   = 480,
     ) -> None:
         from ultralytics import YOLO, YOLOWorld
 

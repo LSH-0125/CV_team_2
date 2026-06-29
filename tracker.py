@@ -21,8 +21,8 @@ from detector import DetectionResult, Box, belonging_meta
 from gallery import Gallery
 import snapshot_store
 
-# BoT-SORT track_buffer 기본값(30)보다 크게 설정해 refind과 충돌 방지
-_LOST_PATIENCE = 45  # frames; should be >= BoT-SORT track_buffer
+# ROI를 벗어난 후 몇 프레임 유예할지 (jitter 방지)
+_ROI_EXIT_PATIENCE = 10  # frames
 
 
 
@@ -44,84 +44,94 @@ class Tracker:
         self._tracker     = _build_botsort(reid_model, device)
 
         # tracklet 생애주기
-        self._seen_ids:    set[int]        = set()
-        self._lost_cands:  dict[int, int]  = {}   # track_id → 연속 부재 프레임 수
-        self._emitted_lost: set[int]       = set()
-        self._pending_new:  set[int]       = set()  # gallery 등록 대기 (seat/emb 미확보)
+        self._seen_ids:      set[int]       = set()
+        self._roi_exit_cands: dict[int,int] = {}  # track_id → ROI 이탈 프레임 수
+        self._emitted_lost:  set[int]       = set()
+        self._pending_new:   set[int]       = set()
 
         # track별 상태
         self._track_state: dict[int, _TrackState] = {}
 
-        # gallery.on_lost_tracklet(has_luggage=True) 후 짐 감시 대상 좌석
-        self._away_seats: set[str] = set()
-        self._last_raw_tracks = []
+        self._away_seats:      set[str] = set()
+        self._last_raw_tracks          = []
 
     # ── 외부 인터페이스 ───────────────────────────────────────────────────
 
     def update(self, frame: np.ndarray, detections: DetectionResult) -> None:
-        """매 프레임 main.py가 호출."""
-        raw_tracks = self._run_botsort(frame, detections.person_boxes)
-        self._last_raw_tracks = raw_tracks
-        active_ids: set[int] = set()
+        """매 프레임 main.py가 호출.
 
-        # ── 1. 활성 track 처리 ──────────────────────────────────────────
+        ROI 기반 tracking:
+          - ROI 안에서 감지된 person만 BoT-SORT에 입력
+          - BoT-SORT track의 bbox가 ROI를 벗어나면 소멸로 판정
+          - 지나다니는 사람은 완전히 무시
+        """
+        # ── 1. ROI 안 person만 BoT-SORT에 입력 ─────────────────────────
+        roi_persons = [b for b in detections.person_boxes
+                       if self._find_seat(b.xyxy) is not None]
+        raw_tracks = self._run_botsort(frame, roi_persons)
+        self._last_raw_tracks = raw_tracks
+
+        # ── 2. 활성 track 처리 (ROI 안에 있는 것만 유효) ───────────────
+        active_in_roi: set[int] = set()
+
         for row in raw_tracks:
             tid  = int(row[4])
             xyxy = row[:4]
-            active_ids.add(tid)
-
             seat = self._find_seat(xyxy)
+
+            if seat is None:
+                # BoT-SORT 예측이 ROI 밖으로 나감 → 이탈 카운트
+                self._roi_exit_cands[tid] = self._roi_exit_cands.get(tid, 0) + 1
+                continue
+
+            active_in_roi.add(tid)
+            self._roi_exit_cands.pop(tid, None)  # ROI 복귀 → 이탈 카운트 초기화
 
             if tid not in self._track_state:
                 self._track_state[tid] = _TrackState(last_seat=seat)
-            elif seat:
+            else:
                 self._track_state[tid].last_seat = seat
 
-            # ── 2. 신규 tracklet ────────────────────────────────────────
+            # 신규 tracklet
             if tid not in self._seen_ids:
                 self._seen_ids.add(tid)
                 self._pending_new.add(tid)
 
-            self._lost_cands.pop(tid, None)
-
-        # ── 3. pending_new → seat 확보 시 크롭에서 임베딩 추출 후 등록 ──
+        # ── 3. pending_new → gallery 등록 ──────────────────────────────
         for tid in list(self._pending_new):
             st = self._track_state.get(tid)
             if not (st and st.last_seat):
                 continue
-
             crop = self._crop_person(frame, tid)
             emb  = self._embed_crop(crop) if crop is not None else None
             if emb is None:
                 emb = np.zeros(512, dtype=np.float32)
-
             self._away_seats.discard(st.last_seat)
             self._gallery.on_new_tracklet(tid, emb, st.last_seat)
             self._pending_new.discard(tid)
-
             pid = self._gallery.get_person_id(tid)
             if pid is not None and crop is not None:
                 snapshot_store.save(pid, st.last_seat, crop, frame)
 
-        # ── 4. lost debounce ────────────────────────────────────────────
+        # ── 4. ROI 이탈 감지 → 소멸 처리 ──────────────────────────────
+        # seen_ids 중 active_in_roi에 없는 것도 이탈 카운트
         for tid in self._seen_ids:
-            if tid not in active_ids and tid not in self._emitted_lost:
-                self._lost_cands[tid] = self._lost_cands.get(tid, 0) + 1
+            if tid not in active_in_roi and tid not in self._emitted_lost:
+                self._roi_exit_cands[tid] = self._roi_exit_cands.get(tid, 0) + 1
 
         to_emit = [
-            tid for tid, cnt in self._lost_cands.items()
-            if cnt >= _LOST_PATIENCE
+            tid for tid, cnt in self._roi_exit_cands.items()
+            if cnt >= _ROI_EXIT_PATIENCE
         ]
         for tid in to_emit:
             self._emitted_lost.add(tid)
-            del self._lost_cands[tid]
-            self._pending_new.discard(tid)  # 등록 전 소멸 — gallery 호출 불필요
+            del self._roi_exit_cands[tid]
+            self._pending_new.discard(tid)
 
             st = self._track_state.get(tid)
             if st and st.last_seat:
                 boxes = self._luggage_boxes_in_seat(st.last_seat, detections.luggage_boxes)
                 items = _boxes_to_belongings(boxes)
-                # LEFT(짐 없음) 시 스냅샷 삭제
                 if not items:
                     pid = self._gallery.get_person_id(tid)
                     if pid is not None:
@@ -166,7 +176,7 @@ class Tracker:
         except Exception:
             return None
 
-    def _find_seat(self, xyxy: np.ndarray, overlap_thresh: float = 0.15) -> Optional[str]:
+    def _find_seat(self, xyxy: np.ndarray, overlap_thresh: float = 0.05) -> Optional[str]:
         """사람 bbox와 ROI의 겹침 비율이 가장 높은 좌석 반환.
 
         단일 점 판별 대신 면적 겹침 비율을 써서 앵글·왜곡에 강인하게 대응.
